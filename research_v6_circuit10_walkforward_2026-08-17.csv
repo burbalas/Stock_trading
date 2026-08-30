@@ -1,0 +1,2 @@
+strategy,folds,positive_folds,avg_test_return_pct,avg_benchmark_return_pct,avg_edge_pct,worst_drawdown_pct,avg_sharpe,total_trades,avg_score
+relative-strength-189-100-b60,6,4,9.8368,10.7825,-0.9457,-23.4504,0.7162,118,3.4503

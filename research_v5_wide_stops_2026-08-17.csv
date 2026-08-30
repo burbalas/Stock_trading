@@ -1,0 +1,3 @@
+strategy,train_return_pct,test_return_pct,benchmark_return_pct,edge_pct,test_max_drawdown_pct,test_sharpe,test_trades,test_score
+relative-strength-189-100-b60,18.4662,50.5237,41.7035,8.8202,-11.4500,1.1590,126,42.8792
+relative-strength-63-150-b60,25.7244,34.0340,41.7035,-7.6695,-12.4022,0.8885,129,25.1695

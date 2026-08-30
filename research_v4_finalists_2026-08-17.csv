@@ -1,0 +1,6 @@
+strategy,train_return_pct,test_return_pct,benchmark_return_pct,edge_pct,test_max_drawdown_pct,test_sharpe,test_trades,test_score
+relative-strength-189-100-b60,23.3074,29.5803,41.7035,-12.1232,-6.9011,1.0689,390,22.2325
+mean-reversion-15-t8,38.5998,9.9162,41.7035,-31.7873,-7.7301,0.5081,138,3.1479
+momentum-20-t4,-2.3104,12.5979,41.7035,-29.1056,-12.8193,0.4564,533,0.1781
+ensemble-20-50-c65,-7.5355,-4.8226,41.7035,-46.5261,-15.4602,-0.2517,142,-18.2151
+ensemble-5-20-c60,3.0257,-19.3647,41.7035,-61.0682,-29.8591,-0.4372,318,-44.6475

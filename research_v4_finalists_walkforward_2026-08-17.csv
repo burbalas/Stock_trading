@@ -1,0 +1,6 @@
+strategy,folds,positive_folds,avg_test_return_pct,avg_benchmark_return_pct,avg_edge_pct,worst_drawdown_pct,avg_sharpe,total_trades,avg_score
+relative-strength-189-100-b60,6,3,7.0321,10.7825,-3.7504,-11.8953,0.7103,630,2.0138
+mean-reversion-15-t8,6,2,4.1661,10.7825,-6.6164,-4.2149,0.4224,219,2.1256
+ensemble-20-50-c65,6,2,4.3978,10.7825,-6.3847,-17.7715,0.4654,841,-3.2601
+momentum-20-t4,6,2,2.6754,10.7825,-8.1071,-16.3030,0.3144,768,-5.0875
+ensemble-5-20-c60,6,1,2.1317,10.7825,-8.6508,-30.8779,0.3352,787,-7.9538
