@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import defaultdict
 from datetime import date
 
 from .advisor import Advisor
 from .broker import PaperBroker
 from .config import BotConfig
-from .data import MarketDataProvider
-from .models import Fill, Order, PortfolioSnapshot
+from .data import MarketDataProvider, validate_market_data
+from .models import Fill, Order, PortfolioSnapshot, Side
 from .portfolio import PortfolioManager
 from .strategies import Strategy, generate_strategy_signals
 
@@ -47,7 +48,7 @@ class TradingEngine:
         self.portfolio = PortfolioManager(config)
 
     def run(self) -> RunResult:
-        market_data = self.data_provider.load(self.config.symbols)
+        market_data = validate_market_data(self.data_provider.load(self.config.symbols), self.config.symbols)
         broker = PaperBroker(
             self.config.starting_cash,
             slippage_bps=self.config.slippage_bps,
@@ -55,39 +56,54 @@ class TradingEngine:
         )
         histories = {symbol.upper(): [] for symbol in self.config.symbols}
         snapshots: list[PortfolioSnapshot] = []
-        all_dates = sorted({candle.date for rows in market_data.values() for candle in rows})
+        candles_by_date = defaultdict(list)
+        for rows in market_data.values():
+            for candle in rows:
+                candles_by_date[candle.date].append(candle)
         latest_prices: dict[str, float] = {}
         peak_equity = self.config.starting_cash
-        pending_orders = []
+        pending_orders: list[Order] = []
         position_highs: dict[str, float] = {}
+        drawdown_halted = False
 
-        for current_date in all_dates:
-            todays_candles = [
-                candle
-                for rows in market_data.values()
-                for candle in rows
-                if candle.date == current_date
-            ]
+        for current_date in sorted(candles_by_date):
+            todays_candles = candles_by_date[current_date]
 
             open_prices = {candle.symbol: candle.open for candle in todays_candles}
-            still_pending = []
             for order in pending_orders:
                 price = open_prices.get(order.symbol)
                 if price is None:
-                    still_pending.append(order)
+                    # Simulated DAY orders expire instead of accumulating across
+                    # missing sessions and filling on an arbitrarily later bar.
                     continue
-                broker.submit(
+                position = broker.positions.get(order.symbol)
+                held_quantity = position.quantity if position else 0
+                quantity = order.quantity
+                if order.side is Side.BUY:
+                    open_equity = broker.snapshot({**latest_prices, **open_prices}, current_date).equity
+                    quantity = min(quantity, self.portfolio.max_buy_quantity(
+                        price, open_equity, broker.cash, held_quantity
+                    ))
+                    if quantity <= 0:
+                        continue
+                fill = broker.submit(
                     Order(
                         symbol=order.symbol,
                         side=order.side,
-                        quantity=order.quantity,
+                        quantity=quantity,
                         price=price,
                         reason=order.reason,
                         client_order_id=order.client_order_id,
                     ),
                     current_date,
                 )
-            pending_orders = still_pending
+                if fill is not None and fill.side is Side.BUY and held_quantity == 0:
+                    position_highs[order.symbol] = fill.price
+            pending_orders = []
+            position_highs = {
+                symbol: high for symbol, high in position_highs.items()
+                if broker.positions.get(symbol) and broker.positions[symbol].quantity > 0
+            }
 
             for candle in todays_candles:
                 histories[candle.symbol].append(candle)
@@ -95,7 +111,7 @@ class TradingEngine:
 
             trading_enabled = self.trade_start_date is None or current_date >= self.trade_start_date
             if not trading_enabled:
-                snapshots.append(broker.snapshot(latest_prices, current_date))
+                # Warm-up builds indicator history, not the measured return series.
                 continue
 
             candles_by_symbol = {candle.symbol: candle for candle in todays_candles}
@@ -109,33 +125,33 @@ class TradingEngine:
                 if position.quantity > 0
             }
             position_highs = {
-                symbol: max(
-                    position_highs.get(symbol, broker.positions[symbol].average_cost),
-                    candles_by_symbol[symbol].high,
-                )
+                symbol: max(position_highs.get(symbol, broker.positions[symbol].average_cost),
+                            candles_by_symbol[symbol].high if symbol in candles_by_symbol else 0.0)
                 for symbol in held_symbols
-                if symbol in candles_by_symbol
             }
 
             snapshot = broker.snapshot(latest_prices, current_date)
             peak_equity = max(peak_equity, snapshot.equity)
             drawdown = (peak_equity - snapshot.equity) / peak_equity if peak_equity else 0.0
-            drawdown_orders = self.portfolio.account_drawdown_orders(latest_prices, broker, drawdown)
-            if drawdown_orders:
-                pending_orders = []
-                for order in drawdown_orders:
-                    broker.submit(order, current_date)
-                snapshots.append(broker.snapshot(latest_prices, current_date))
+            drawdown_halted = drawdown_halted or drawdown >= self.config.max_drawdown_stop_pct
+            if drawdown_halted:
+                # The close is only known after this bar. Liquidate at the next
+                # open, including its gap and costs, and latch the circuit stop.
+                pending_orders = self.portfolio.account_drawdown_orders(
+                    latest_prices, broker, self.config.max_drawdown_stop_pct
+                )
+                snapshots.append(snapshot)
                 continue
 
             signal_histories = {
                 symbol: history
                 for symbol, history in histories.items()
-                if history and symbol not in stopped_symbols
+                if history and history[-1].date == current_date
             }
             signals = [
                 self.advisor.review(signal, signal_histories[signal.symbol])
                 for signal in generate_strategy_signals(self.strategy, signal_histories)
+                if signal.symbol not in stopped_symbols
             ]
 
             if drawdown < self.config.max_drawdown_stop_pct:

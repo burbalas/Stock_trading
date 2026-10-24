@@ -1,48 +1,24 @@
 from __future__ import annotations
 
 from .config import BotConfig
-from .models import Order, Signal, Side
+from .models import Order, Signal
 from .portfolio import PortfolioManager
 
 
 class RiskManager:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
+        self.portfolio = PortfolioManager(config)
 
     def build_order(self, signal: Signal, price: float, broker, equity: float) -> Order | None:
-        if signal.side is Side.HOLD or signal.confidence < self.config.min_confidence:
-            return None
-
-        position = broker.positions.get(signal.symbol)
-        current_quantity = position.quantity if position else 0
-        average_cost = position.average_cost if position else 0.0
-
-        if signal.side is Side.SELL:
-            if current_quantity <= 0:
-                return None
-            return Order(signal.symbol, Side.SELL, current_quantity, price, signal.reason)
-
-        max_position_value = equity * self.config.max_position_pct
-        current_value = current_quantity * price
-        remaining_position_room = max(0.0, max_position_value - current_value)
-        max_order_value = min(equity * self.config.max_order_pct, broker.cash, remaining_position_room)
-        quantity = int(max_order_value // price)
-
-        if quantity <= 0:
-            return None
-
-        if average_cost and price <= average_cost * (1 - self.config.stop_loss_pct):
-            return None
-
-        return Order(signal.symbol, Side.BUY, quantity, price, signal.reason)
+        prices = dict(getattr(broker, "position_prices", {}))
+        prices[signal.symbol] = price
+        plan = self.portfolio.build_order_plan([signal], prices, broker, equity)
+        return plan.orders[0] if plan.orders else None
 
     def stop_loss_order(self, symbol: str, price: float, broker) -> Order | None:
-        position = broker.positions.get(symbol)
-        if not position or position.quantity <= 0 or position.average_cost <= 0:
-            return None
-        if price <= position.average_cost * (1 - self.config.stop_loss_pct):
-            return Order(symbol, Side.SELL, position.quantity, price, "stop loss")
-        return None
+        orders = self.portfolio.stop_loss_orders({symbol: price}, broker)
+        return orders[0] if orders else None
 
 
 class PortfolioRiskManager(PortfolioManager):

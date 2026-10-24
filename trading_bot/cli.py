@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
+import math
 import sys
 import time
+from contextlib import nullcontext
 from datetime import date, datetime, time as day_time
 from pathlib import Path
 
@@ -15,13 +19,19 @@ from .engine import TradingEngine
 from .journal import TradeJournal
 from .live import LiveTradingEngine
 from .models import Fill, Order, Side
-from .reconcile import reconcile_positions
+from .reconcile import reconcile_positions, sync_broker_orders
+from .runtime import stop_requested, wait_for_next_check, write_heartbeat
+from .monitoring import operator_status, record_account_observation
+from .paper_control import paper_execution_lock
+from .runtime_paths import resolve_journal_directory
 from .research import (
     POPULAR_STOCKS,
     build_expanded_strategy_specs,
     build_strategy_specs,
     evaluate_specs,
     evaluate_walk_forward,
+    build_research_manifest,
+    assess_research_evidence,
 )
 from .strategies import (
     EnsembleStrategy,
@@ -47,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         command_parser.add_argument("--cash", type=float, default=10_000.0)
         command_parser.add_argument("--days", type=int, default=180)
         command_parser.add_argument("--feed", default="iex")
+        command_parser.add_argument("--entry-limit-bps", type=float, default=None, help="Use IOC limit BUYs capped this many basis points above the fresh ask")
         command_parser.add_argument("--short-window", type=int, default=10)
         command_parser.add_argument("--long-window", type=int, default=30)
         command_parser.add_argument("--min-confidence", type=float, default=0.55)
@@ -111,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     close_audit.add_argument("--skip-tests", action="store_true")
     close_audit.add_argument("--submit", action="store_true", help="Submit/raise missing protective stops during audit")
 
-    promote = subparsers.add_parser("promotion-report", help="Evaluate whether research evidence justifies changing live strategy")
+    promote = subparsers.add_parser("promotion-report", help="Compare exploratory strategy candidates for paper testing")
     promote.add_argument("--research-csv", default="research_expanded_2026-07-27.csv")
     promote.add_argument("--walk-forward-csv", default="research_expanded_walkforward_2026-07-27.csv")
     promote.add_argument("--current", default="ensemble-5-20-c65")
@@ -121,7 +132,13 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--min-score-improvement", type=float, default=2.0)
     promote.add_argument("--max-worst-drawdown-pct", type=float, default=-15.0)
 
-    risk_promote = subparsers.add_parser("risk-promotion-report", help="Evaluate whether risk research justifies changing stop settings")
+    readiness = subparsers.add_parser("readiness-report", help="Audit strategy evidence offline; never submits orders")
+    readiness.add_argument("--research-csv", default="research_v6_circuit10_2026-08-17.csv")
+    readiness.add_argument("--walk-forward-csv", default="research_v6_circuit10_walkforward_2026-08-17.csv")
+    readiness.add_argument("--manifest", help="Research manifest JSON; inferred from research CSV when omitted")
+    readiness.add_argument("--output", default="var/readiness_report.json")
+
+    risk_promote = subparsers.add_parser("risk-promotion-report", help="Compare exploratory risk settings for paper testing")
     risk_promote.add_argument("--risk-csv", default="risk_research_2026-08-04.csv")
     risk_promote.add_argument("--current-stop-loss-pct", type=float, default=0.08)
     risk_promote.add_argument("--current-trailing-stop-pct", type=float, default=0.05)
@@ -165,7 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     research = subparsers.add_parser("research", help="Compare strategies on a multi-symbol universe")
     research.add_argument("--symbols", nargs="+", default=POPULAR_STOCKS, help="Symbols to evaluate")
     research.add_argument("--symbols-file", help="Optional file of symbols, one per line or comma-separated")
-    research.add_argument("--data", choices=["demo", "alpaca"], default="alpaca")
+    research.add_argument("--data", choices=["demo", "alpaca", "csv"], default="alpaca")
+    research.add_argument("--csv", help="Historical OHLCV CSV for reproducible offline research")
     research.add_argument("--days", type=int, default=730)
     research.add_argument("--feed", default="iex")
     research.add_argument("--cash", type=float, default=100_000.0)
@@ -284,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     alpaca.add_argument("--allow-position-adds", action="store_true", help="Allow buying more of symbols already held")
     alpaca.add_argument("--buy-cooldown-days", type=int, default=3)
     alpaca.add_argument("--submit", action="store_true", help="Actually submit generated orders to Alpaca paper")
+    alpaca.add_argument("--entry-limit-bps", type=float, default=None, help="Cap IOC limit BUYs above the fresh ask")
 
     loop = subparsers.add_parser("alpaca-loop", help="Run Alpaca latest-signal checks repeatedly")
     loop.add_argument("--symbols", nargs="+", default=["AAPL", "MSFT"], help="Symbols to evaluate")
@@ -328,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     loop.add_argument("--interval-minutes", type=float, default=15.0)
     loop.add_argument("--cycles", type=int, default=1, help="Number of cycles to run; use 0 for endless")
     loop.add_argument("--submit", action="store_true", help="Actually submit generated orders to Alpaca paper")
+    loop.add_argument("--entry-limit-bps", type=float, default=None, help="Cap IOC limit BUYs above the fresh ask")
 
     risk = subparsers.add_parser("alpaca-risk", help="Run a fast risk/exit check without scanning new buy signals")
     add_live_arguments(risk)
@@ -335,12 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     session = subparsers.add_parser("alpaca-session", help="Run frequent risk checks and slower signal checks")
     add_live_arguments(session)
     session.add_argument("--risk-interval-minutes", type=float, default=5.0)
-    session.add_argument("--signal-interval-minutes", type=float, default=30.0)
+    session.add_argument("--signal-interval-minutes", type=float, default=390.0)
     session.add_argument("--protective-stop-sync-minutes", type=float, default=15.0)
     session.add_argument("--no-protective-stops", action="store_true", help="Do not create or raise broker-side stops during the session")
     session.add_argument("--cycles", type=int, default=12, help="Number of risk cycles to run; use 0 for endless")
     session.add_argument("--until-close", action="store_true", help="Run until Alpaca reports that the market is closed")
     session.add_argument("--wait-for-open", action="store_true", help="Wait for market open before starting the session")
+    session.add_argument("--continuous", action="store_true", help="Run across sessions, waiting through nights and market holidays")
     session.add_argument("--max-consecutive-errors", type=int, default=5, help="Retry transient session failures before exiting")
     session.add_argument("--shadow-strategy", choices=STRATEGY_CHOICES, help="Record a second strategy without submitting its orders")
     session.add_argument("--shadow-journal-dir", default="var\\shadow")
@@ -367,6 +388,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         args = parser.parse_args(["demo"])
     _apply_profile(args, _provided_options(raw_args))
+    _validate_runtime_args(args, parser)
+    if hasattr(args, "journal_dir"):
+        args.journal_dir = str(resolve_journal_directory(args.journal_dir))
+    if hasattr(args, "shadow_journal_dir"):
+        args.shadow_journal_dir = str(resolve_journal_directory(args.shadow_journal_dir))
+    if getattr(args, "continuous", False):
+        if args.until_close:
+            parser.error("--continuous and --until-close are mutually exclusive")
+        args.cycles = 0
+        args.wait_for_open = True
+    lock = TradeJournal(args.journal_dir).lock("execution", timeout=0) if getattr(args, "submit", False) else nullcontext()
+    user_lock = paper_execution_lock() if getattr(args, "submit", False) else nullcontext()
+    with user_lock, lock:
+        return _execute_command(args, parser)
+
+
+def _execute_command(args, parser) -> int:
 
     if args.command == "doctor":
         _doctor()
@@ -390,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "promotion-report":
         _promotion_report(args)
+        return 0
+
+    if args.command == "readiness-report":
+        _readiness_report(args)
         return 0
 
     if args.command == "risk-promotion-report":
@@ -485,10 +527,44 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _validate_runtime_args(args, parser) -> None:
+    for name in ("days", "risk_interval_minutes", "signal_interval_minutes", "protective_stop_sync_minutes", "interval_minutes", "max_consecutive_errors"):
+        value = getattr(args, name, None)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+    for name in ("cycles", "open_buffer_minutes", "close_buffer_minutes"):
+        value = getattr(args, name, None)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    for name in ("stop_loss_pct", "trailing_stop_pct", "max_drawdown_stop_pct"):
+        value = getattr(args, name, None)
+        if value is not None and (not math.isfinite(value) or not 0 < value < 1):
+            parser.error(f"--{name.replace('_', '-')} must be finite and between 0 and 1")
+    if args.command == "research" and args.data == "csv" and not args.csv:
+        parser.error("research --data csv requires --csv")
+
+
+def _session_broker(args):
+    if getattr(args, "_broker_override", None) is not None:
+        return args._broker_override
+    if getattr(args, "live_policy_path", None):
+        from .live_trading import AlpacaLiveBroker, LivePolicy
+        return AlpacaLiveBroker(LivePolicy.load(args.live_policy_path), submit_enabled=args.submit)
+    limit = getattr(args, "entry_limit_bps", None)
+    return AlpacaPaperBroker(entry_limit_bps=limit) if limit is not None else AlpacaPaperBroker()
+
+
+def _session_data(args, **kwargs):
+    if getattr(args, "live_policy_path", None):
+        from .live_trading import AlpacaLiveMarketDataProvider
+        return AlpacaLiveMarketDataProvider(**kwargs)
+    return AlpacaMarketDataProvider(**kwargs)
+
+
 def _run_alpaca_once(args):
     symbols = _resolve_symbols(args.symbols, args.symbols_file)
     config = _live_config(args, symbols)
-    broker = AlpacaPaperBroker()
+    broker = _session_broker(args)
     journal = TradeJournal(args.journal_dir)
     if not getattr(args, "shadow_mode", False):
         _sync_alpaca_protective_fills(journal, broker)
@@ -511,11 +587,8 @@ def _run_alpaca_once(args):
             minutes_since_open = _minutes_since_regular_open(clock.timestamp)
             open_buffer = getattr(args, "open_buffer_minutes", 10.0)
             if 0 <= minutes_since_open < open_buffer:
-                raise RuntimeError(
-                    "Too close to market open for fresh buy submissions "
-                    f"({minutes_since_open:.1f} minutes after open, buffer is {open_buffer:.1f}). "
-                    "Use --sell-only to keep exits active, or --allow-near-open if you deliberately want this."
-                )
+                config = _live_config(args, symbols, allow_new_buys=False)
+                print("Open buffer active: new buys paused; exits remain available.")
     if (
         getattr(args, "submit", False)
         and not getattr(args, "sell_only", False)
@@ -526,11 +599,8 @@ def _run_alpaca_once(args):
             minutes_to_close = (clock.next_close - clock.timestamp).total_seconds() / 60
             close_buffer = getattr(args, "close_buffer_minutes", 15.0)
             if minutes_to_close <= close_buffer:
-                raise RuntimeError(
-                    "Too close to market close for fresh buy submissions "
-                    f"({minutes_to_close:.1f} minutes left, buffer is {close_buffer:.1f}). "
-                    "Use --sell-only to keep exits active, or --allow-near-close if you deliberately want this."
-                )
+                config = _live_config(args, symbols, allow_new_buys=False)
+                print("Close buffer active: new buys paused; exits remain available.")
     if getattr(args, "submit", False) and not reconciliation.ok:
         raise RuntimeError(
             "Bot/Alpaca position reconciliation failed; refusing to submit. "
@@ -538,11 +608,13 @@ def _run_alpaca_once(args):
         )
 
     clock = clock or broker.market_clock()
-    incomplete_date = clock.timestamp.date() if clock.is_open else None
+    market_time = clock.timestamp.astimezone(MARKET_TZ)
+    # Before today's close (including premarket), today's daily bar is incomplete.
+    incomplete_date = market_time.date() if clock.is_open or clock.next_open.astimezone(MARKET_TZ).date() == market_time.date() else None
     lookback_days = max(args.days, 400) if args.strategy == "relative-strength" else args.days
     engine = LiveTradingEngine(
         config=config,
-        data_provider=AlpacaMarketDataProvider(
+        data_provider=_session_data(args,
             days=lookback_days,
             feed=args.feed,
             exclude_date=incomplete_date,
@@ -558,7 +630,7 @@ def _run_alpaca_once(args):
 def _run_alpaca_risk_once(args):
     symbols = _resolve_symbols(args.symbols, args.symbols_file)
     config = _live_config(args, symbols, allow_new_buys=False)
-    broker = AlpacaPaperBroker()
+    broker = _session_broker(args)
     journal = TradeJournal(args.journal_dir)
     _sync_alpaca_protective_fills(journal, broker)
     reconciliation = reconcile_positions(journal, broker)
@@ -577,7 +649,7 @@ def _run_alpaca_risk_once(args):
 
     engine = LiveTradingEngine(
         config=config,
-        data_provider=AlpacaMarketDataProvider(days=args.days, feed=args.feed),
+        data_provider=_session_data(args, days=args.days, feed=args.feed),
         strategy=_build_strategy(args.strategy, config),
         advisor=HeuristicAdvisor(),
         broker=broker,
@@ -587,32 +659,70 @@ def _run_alpaca_risk_once(args):
 
 
 def _run_alpaca_session(args) -> None:
+    try:
+        _run_alpaca_session_loop(args)
+    except KeyboardInterrupt:
+        write_heartbeat(args.journal_dir, "stopped", reason="keyboard interrupt")
+        print("Session stopped. Existing broker-side protective orders remain active.")
+    except Exception as exc:
+        try:
+            write_heartbeat(args.journal_dir, "failed", error=str(exc))
+        except OSError as heartbeat_error:
+            exc.add_note(f"Could not write failure heartbeat: {heartbeat_error}")
+        raise
+    else:
+        write_heartbeat(args.journal_dir, "stopped", reason="session complete or STOP file")
+
+
+def _run_alpaca_session_loop(args) -> None:
     cycles = 0
     next_signal_at = 0.0
     next_protect_at = 0.0
+    previous_market_date = None
+    clock_broker = None
+
+    def read_session_clock():
+        nonlocal clock_broker
+        if clock_broker is None:
+            clock_broker = _session_broker(args)
+        return clock_broker.market_clock()
+
     while args.until_close or args.cycles == 0 or cycles < args.cycles:
+        if stop_requested(args.journal_dir):
+            break
         clock = None
         if _session_needs_clock(args):
-            clock = _session_retry(args, "Market clock", lambda: AlpacaPaperBroker().market_clock())
+            clock = _session_retry(args, "Market clock", read_session_clock)
             if not clock.is_open:
-                if getattr(args, "wait_for_open", False):
-                    wait_seconds = _session_wait_for_open_seconds(args, clock)
+                if getattr(args, "wait_for_open", False) and not (args.until_close and cycles > 0):
+                    wait_seconds = min(60.0, _session_wait_for_open_seconds(args, clock))
+                    write_heartbeat(args.journal_dir, "waiting_for_open", next_open=clock.next_open.isoformat())
                     print(
                         f"Market is closed. Waiting until "
                         f"{format_local(clock.next_open)} Lithuania time"
                         f"{' plus open buffer' if _fresh_buy_open_buffer_enabled(args) else ''}."
                     )
-                    time.sleep(wait_seconds)
+                    if not wait_for_next_check(wait_seconds, args.journal_dir):
+                        break
                     continue
                 print(f"Market is closed. Next open: {format_local(clock.next_open)} Lithuania time.")
                 break
+            market_date = clock.timestamp.astimezone(MARKET_TZ).date()
+            if market_date != previous_market_date:
+                next_signal_at = next_protect_at = 0.0
+                previous_market_date = market_date
         cycles += 1
+        write_heartbeat(args.journal_dir, "running", cycle=cycles, submit=args.submit, strategy=args.strategy)
         print(f"Risk cycle {cycles}")
         risk_result = _session_retry(args, "Risk cycle", lambda: _run_alpaca_risk_once(args))
         _print_live_result(risk_result, submitted=args.submit)
+        _record_session_observation(args, risk_result, "risk", clock)
 
         now = time.monotonic()
-        if args.submit and not getattr(args, "no_protective_stops", False) and now >= next_protect_at:
+        attempted_risk_exit = any(decision.order and decision.order.side is Side.SELL
+                                  for decision in getattr(risk_result, "decisions", []))
+        if (args.submit and not getattr(args, "no_protective_stops", False)
+                and (now >= next_protect_at or attempted_risk_exit)):
             print()
             print("Protective stop sync")
             _session_retry(args, "Protective stop sync", lambda: _alpaca_protect(args))
@@ -629,6 +739,15 @@ def _run_alpaca_session(args) -> None:
                 print("Signal cycle")
                 signal_result = _session_retry(args, "Signal cycle", lambda: _run_alpaca_once(args))
                 _print_live_result(signal_result, submitted=args.submit)
+                _record_session_observation(args, signal_result, "signal", clock)
+                if (
+                    args.submit and not getattr(args, "no_protective_stops", False)
+                    and any(decision.order and decision.order.side is Side.BUY for decision in signal_result.decisions)
+                ):
+                    # Protect newly confirmed entries immediately. Orders still
+                    # awaiting fills are checked again on the next risk cycle.
+                    _session_retry(args, "Entry protection", lambda: _alpaca_protect(args))
+                    next_protect_at = 0.0
                 if getattr(args, "shadow_strategy", None) and args.shadow_strategy != args.strategy:
                     print()
                     print(f"Shadow signal cycle ({args.shadow_strategy})")
@@ -641,9 +760,22 @@ def _run_alpaca_session(args) -> None:
                     _print_live_result(shadow_result, submitted=False)
                 next_signal_at = now + max(1.0, args.signal_interval_minutes * 60)
 
+        write_heartbeat(args.journal_dir, "healthy", cycle=cycles, equity=risk_result.equity, submit=args.submit)
+
         if not args.until_close and args.cycles != 0 and cycles >= args.cycles:
             break
-        time.sleep(_session_sleep_seconds(args, clock))
+        if not wait_for_next_check(_session_sleep_seconds(args, clock), args.journal_dir):
+            break
+
+
+def _record_session_observation(args, result, phase, clock):
+    parameters = {key: value for key, value in vars(args).items()
+                  if key not in {"journal_dir", "shadow_journal_dir"}}
+    if getattr(args, "symbols_file", None):
+        parameters["resolved_symbols"] = _resolve_symbols(args.symbols, args.symbols_file)
+    market_date = clock.timestamp.astimezone(MARKET_TZ).date() if clock else None
+    record_account_observation(args.journal_dir, result.equity, strategy=args.strategy,
+                               submit=args.submit, phase=phase, parameters=parameters, market_date=market_date)
 
 
 def _session_retry(args, label: str, operation):
@@ -685,6 +817,8 @@ def _session_sleep_seconds(args, clock=None) -> float:
 
 def _session_needs_clock(args) -> bool:
     return (
+        getattr(args, "command", "") == "alpaca-session"
+        or
         getattr(args, "until_close", False)
         or getattr(args, "wait_for_open", False)
         or _fresh_buy_open_buffer_enabled(args)
@@ -719,8 +853,68 @@ def _open_buffer_remaining_seconds(args, clock) -> float:
     return max(0.0, remaining_minutes * 60)
 
 
+def _protective_lookup_status(remote_order, symbol: str, client_order_id: str) -> str:
+    """Accept only an unfilled stop with the requested, broker-confirmed identity."""
+    side = getattr(remote_order, "side", "")
+    order_type = getattr(remote_order, "type", "")
+    if (str(getattr(remote_order, "client_order_id", "")) != client_order_id
+            or str(getattr(remote_order, "symbol", "")).upper() != symbol.upper()
+            or str(getattr(side, "value", side)).lower() != "sell"
+            or str(getattr(order_type, "value", order_type)).lower() != "stop"):
+        raise RuntimeError("Protective order lookup returned a different identity; reconciliation required.")
+    try:
+        filled_quantity = float(remote_order.filled_qty)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Protective order has no confirmed fill quantity; reconciliation required.") from exc
+    if not math.isfinite(filled_quantity) or filled_quantity != 0:
+        raise RuntimeError("Protective order may have executed; reconcile fills before restoring protection.")
+    status = getattr(remote_order, "status", "")
+    return str(getattr(status, "value", status)).lower()
+
+
+def _protective_stop_attempt(broker, symbol: str, trade_date: date):
+    """Keep a stable ID unless direct lookup proves an earlier attempt terminal."""
+    base_id = f"bot-protect-{symbol.lower()}-{trade_date.isoformat()}"
+    # One initial stop plus recovery after each of the three allowed risk exits.
+    for attempt in range(1, 5):
+        client_order_id = base_id if attempt == 1 else f"{base_id}-r{attempt}"
+        existing = broker.order_by_client_id(client_order_id)
+        if existing is None:
+            return client_order_id, None
+        status = _protective_lookup_status(existing, symbol, client_order_id)
+        if status in {"canceled", "expired", "rejected"}:
+            continue
+        if status in {"new", "accepted", "accepted_for_bidding"}:
+            return client_order_id, existing
+        raise RuntimeError(
+            f"Protective order {client_order_id} has unresolved status {status!r}; "
+            "refusing a new stop until reconciliation."
+        )
+    raise RuntimeError(f"Protective stop retry limit reached for {symbol}: four attempts per trading date.")
+
+
+def _confirmed_protective_stop_price(remote_order, symbol: str, client_order_id: str,
+                                     quantity: float, minimum_stop_price: float) -> float:
+    status = _protective_lookup_status(remote_order, symbol, client_order_id)
+    if status not in {"new", "accepted", "accepted_for_bidding"}:
+        raise RuntimeError(
+            f"Protective order {client_order_id} is not confirmed active (status {status!r}); "
+            "protection was not recorded."
+        )
+    try:
+        remote_quantity = float(remote_order.qty)
+        remote_stop = float(remote_order.stop_price)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Protective order has invalid quantity or stop price; protection was not recorded.") from exc
+    if (not math.isfinite(remote_quantity) or remote_quantity != quantity
+            or not math.isfinite(remote_stop) or remote_stop <= 0
+            or remote_stop + 1e-9 < round(minimum_stop_price, 2)):
+        raise RuntimeError("Protective order differs from the required quantity or stop; protection was not recorded.")
+    return remote_stop
+
+
 def _alpaca_protect(args) -> None:
-    broker = AlpacaPaperBroker()
+    broker = _session_broker(args)
     journal = TradeJournal(args.journal_dir)
     _sync_alpaca_protective_fills(journal, broker)
     reconciliation = reconcile_positions(journal, broker)
@@ -754,22 +948,48 @@ def _alpaca_protect(args) -> None:
         stop_price = float(row["active_stop"])
         existing_order = open_sell_orders.get(symbol)
         if existing_order:
+            existing_id = str(getattr(existing_order, "client_order_id", ""))
+            tracked = state.get("protective_orders", {}).get(symbol, {})
+            owned = existing_id.startswith("bot-protect-") or existing_id == tracked.get("client_order_id")
+            status = str(getattr(getattr(existing_order, "status", ""), "value", getattr(existing_order, "status", ""))).lower()
+            if not owned or status in {"pending_cancel", "pending_replace"}:
+                print(f"{symbol:6} SKIP open sell order is externally managed or pending broker confirmation")
+                continue
+            if float(getattr(existing_order, "filled_qty", 0) or 0) > 0:
+                print(f"{symbol:6} SKIP partially filled stop; keep its remaining protection until execution is resolved")
+                continue
             existing_stop = float(getattr(existing_order, "stop_price", 0.0) or 0.0)
-            if stop_price > existing_stop + 0.01:
-                print(f"{symbol:6} RAISE STOP {position.quantity} ${existing_stop:.2f} -> ${stop_price:.2f}")
+            if existing_stop <= 0:
+                print(f"{symbol:6} SKIP open sell order is not a protective stop")
+                continue
+            existing_quantity = float(getattr(existing_order, "qty", position.quantity))
+            if stop_price > existing_stop + 0.01 or existing_quantity != position.quantity:
+                stop_price = max(stop_price, existing_stop)
+                print(f"{symbol:6} UPDATE STOP {position.quantity} ${existing_stop:.2f} -> ${stop_price:.2f}")
                 if args.submit:
                     replacement = broker.replace_stop_order(existing_order.id, stop_price, position.quantity)
                     client_order_id = str(getattr(replacement, "client_order_id", "") or existing_order.client_order_id)
-                    journal.mark_protective_order(symbol, client_order_id, stop_price, position.quantity)
+                    confirmed_stop_price = _confirmed_protective_stop_price(
+                        replacement, symbol, client_order_id, position.quantity, stop_price,
+                    )
+                    journal.mark_protective_order(symbol, client_order_id, confirmed_stop_price, position.quantity)
             else:
                 print(f"{symbol:6} SKIP existing open sell order @ ${existing_stop:.2f}")
-                journal.mark_protective_order(symbol, str(existing_order.client_order_id), existing_stop, position.quantity)
+                if args.submit:
+                    confirmed_stop_price = _confirmed_protective_stop_price(
+                        existing_order, symbol, str(existing_order.client_order_id), position.quantity, stop_price,
+                    )
+                    journal.mark_protective_order(symbol, str(existing_order.client_order_id), confirmed_stop_price, position.quantity)
             continue
-        client_order_id = f"bot-protect-{symbol.lower()}-{broker.trading_date().isoformat()}"
         print(f"{symbol:6} STOP SELL {position.quantity} @ ${stop_price:.2f}")
         if args.submit:
-            broker.submit_protective_stop(symbol, position.quantity, stop_price, client_order_id)
-            journal.mark_protective_order(symbol, client_order_id, stop_price, position.quantity)
+            client_order_id, protective_order = _protective_stop_attempt(broker, symbol, broker.trading_date())
+            if protective_order is None:
+                protective_order = broker.submit_protective_stop(symbol, position.quantity, stop_price, client_order_id)
+            confirmed_stop_price = _confirmed_protective_stop_price(
+                protective_order, symbol, client_order_id, position.quantity, stop_price,
+            )
+            journal.mark_protective_order(symbol, client_order_id, confirmed_stop_price, position.quantity)
 
 
 def _alpaca_exec_smoke(args) -> None:
@@ -807,9 +1027,9 @@ def _alpaca_exec_smoke(args) -> None:
         client_order_id=f"bot-smoke-{run_id}-{symbol.lower()}-buy",
     )
     buy_fill = broker.submit(buy_order, trade_date)
-    if not buy_fill:
-        raise RuntimeError("Smoke buy did not return a fill.")
-    journal.record_fill(buy_fill, mode="alpaca-exec-smoke")
+    journal.record_broker_order(broker.last_submitted_order, mode="alpaca-exec-smoke")
+    if not buy_fill or buy_fill.quantity != args.quantity:
+        raise RuntimeError(f"Smoke buy is not fully filled; inspect Alpaca order {buy_order.client_order_id} before continuing.")
     journal.mark_submitted(TradeJournal.order_key(buy_order, buy_fill.date))
     print(f"BUY filled:  {buy_fill.quantity} {symbol} @ ${buy_fill.price:,.2f}")
 
@@ -832,9 +1052,9 @@ def _alpaca_exec_smoke(args) -> None:
         client_order_id=f"bot-smoke-{run_id}-{symbol.lower()}-sell",
     )
     sell_fill = broker.submit(sell_order, trade_date)
-    if not sell_fill:
-        raise RuntimeError("Smoke sell did not return a fill.")
-    journal.record_fill(sell_fill, mode="alpaca-exec-smoke")
+    journal.record_broker_order(broker.last_submitted_order, mode="alpaca-exec-smoke")
+    if not sell_fill or sell_fill.quantity != buy_fill.quantity:
+        raise RuntimeError(f"Smoke sell is not fully filled; inspect Alpaca order {sell_order.client_order_id} before continuing.")
     journal.mark_submitted(TradeJournal.order_key(sell_order, sell_fill.date))
     print(f"SELL filled: {sell_fill.quantity} {symbol} @ ${sell_fill.price:,.2f}")
 
@@ -848,11 +1068,11 @@ def _alpaca_exec_smoke(args) -> None:
 def _validate_exec_smoke_args(args, symbol: str, price: float, broker: AlpacaPaperBroker) -> None:
     if args.quantity <= 0:
         raise ValueError("--quantity must be positive")
-    if args.max_notional <= 0:
+    if not math.isfinite(args.max_notional) or args.max_notional <= 0:
         raise ValueError("--max-notional must be positive")
     if not 0 < args.stop_pct < 1:
         raise ValueError("--stop-pct must be between 0 and 1")
-    if price <= 0:
+    if not math.isfinite(price) or price <= 0:
         raise RuntimeError(f"Could not estimate a positive price for {symbol}.")
     notional = price * args.quantity
     if notional > args.max_notional:
@@ -862,11 +1082,8 @@ def _validate_exec_smoke_args(args, symbol: str, price: float, broker: AlpacaPap
 
 
 def _latest_alpaca_price(symbol: str, feed: str) -> float:
-    data = AlpacaMarketDataProvider(days=10, feed=feed).load([symbol])
-    rows = data.get(symbol.upper(), [])
-    if not rows:
-        raise RuntimeError(f"No recent Alpaca data returned for {symbol}.")
-    return rows[-1].close
+    provider = AlpacaMarketDataProvider(days=10, feed=feed)
+    return provider.latest_entry_prices([symbol])[symbol.upper()]
 
 
 def _open_sell_order_symbols(open_orders) -> set[str]:
@@ -891,38 +1108,12 @@ def _open_sell_orders_by_symbol(open_orders) -> dict[str, object]:
 
 def _active_order_status(order) -> bool:
     status = str(getattr(getattr(order, "status", ""), "value", getattr(order, "status", ""))).lower()
-    return status not in {"pending_replace", "pending_cancel", "replaced", "canceled", "expired"}
+    return status not in {"filled", "rejected", "replaced", "canceled", "expired"}
 
 
 def _sync_alpaca_protective_fills(journal: TradeJournal, broker: AlpacaPaperBroker) -> int:
-    synced = 0
-    if not hasattr(broker, "closed_orders"):
-        return synced
-    state = journal._read_state()
-    protective_orders = state.get("protective_orders", {})
-    protective_order_ids = {
-        str(details.get("client_order_id", ""))
-        for details in protective_orders.values()
-        if isinstance(details, dict) and details.get("client_order_id")
-    }
-    for remote_order in broker.closed_orders():
-        client_order_id = str(getattr(remote_order, "client_order_id", "") or "")
-        if not _is_known_protective_order(remote_order, client_order_id, protective_order_ids):
-            continue
-        if journal.has_synced_order(client_order_id):
-            continue
-        status = getattr(getattr(remote_order, "status", ""), "value", getattr(remote_order, "status", ""))
-        if str(status).lower() != "filled":
-            continue
-        fill = _fill_from_remote_protective_order(remote_order)
-        if not fill:
-            continue
-        journal.record_fill(fill, mode="alpaca-paper-sync")
-        journal.mark_submitted(TradeJournal.order_key(fill_to_order(fill), fill.date))
-        journal.mark_synced_order(client_order_id)
-        journal.clear_protective_order(fill.symbol)
-        synced += 1
-    return synced
+    # Compatibility name: synchronize every bot order, including partial fills.
+    return sync_broker_orders(journal, broker)
 
 
 def _is_known_protective_order(remote_order, client_order_id: str, protective_order_ids: set[str]) -> bool:
@@ -930,7 +1121,7 @@ def _is_known_protective_order(remote_order, client_order_id: str, protective_or
 
 
 def _fill_from_remote_protective_order(remote_order):
-    quantity = int(float(getattr(remote_order, "filled_qty", 0) or 0))
+    quantity = float(getattr(remote_order, "filled_qty", 0) or 0)
     price = float(getattr(remote_order, "filled_avg_price", 0) or 0)
     if quantity <= 0 or price <= 0:
         return None
@@ -954,6 +1145,8 @@ def fill_to_order(fill: Fill):
 def _live_config(args, symbols: list[str], allow_new_buys: bool | None = None) -> BotConfig:
     if allow_new_buys is None:
         allow_new_buys = not getattr(args, "sell_only", False)
+    if (Path(getattr(args, "journal_dir", "var")) / "STOP_BUYS").exists():
+        allow_new_buys = False
     return BotConfig(
         symbols=symbols,
         starting_cash=args.cash,
@@ -978,11 +1171,12 @@ def _live_config(args, symbols: list[str], allow_new_buys: bool | None = None) -
 
 def _research(args) -> None:
     symbols = _resolve_symbols(args.symbols, args.symbols_file)
-    provider = (
-        AlpacaMarketDataProvider(days=args.days, feed=args.feed)
-        if args.data == "alpaca"
-        else DemoMarketDataProvider(days=args.days)
-    )
+    if args.data == "alpaca":
+        provider = AlpacaMarketDataProvider(days=args.days, feed=args.feed)
+    elif args.data == "csv":
+        provider = CsvMarketDataProvider(args.csv)
+    else:
+        provider = DemoMarketDataProvider(days=args.days)
     print(f"Loading {args.data} data for {len(symbols)} symbols...")
     data = provider.load(symbols)
     loaded = [symbol for symbol, rows in data.items() if rows]
@@ -1022,6 +1216,50 @@ def _research(args) -> None:
         if args.walk_forward_csv_out:
             _write_walk_forward_csv(args.walk_forward_csv_out, walk_rows)
         _print_walk_forward(walk_rows[: args.top])
+    if args.csv_out:
+        manifest = build_research_manifest(data, loaded, config, specs, data_source=args.data,
+                                           train_pct=args.train_pct, folds=args.folds if args.walk_forward else None)
+        manifest["artifacts"] = {"research_sha256": _file_digest(args.csv_out)}
+        if args.walk_forward and args.walk_forward_csv_out:
+            manifest["artifacts"]["walk_forward_sha256"] = _file_digest(args.walk_forward_csv_out)
+        manifest_path = Path(str(args.csv_out) + ".manifest.json")
+        manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(f"Research provenance: {manifest_path}")
+
+
+def _file_digest(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _readiness_report(args) -> dict:
+    research_rows = _load_csv_rows(Path(args.research_csv))
+    walk_rows = _load_csv_rows(Path(args.walk_forward_csv))
+    manifest_path = Path(args.manifest or (str(args.research_csv) + ".manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    artifacts_valid = bool(
+        isinstance(manifest, dict)
+        and artifacts.get("research_sha256") == _file_digest(args.research_csv)
+        and artifacts.get("walk_forward_sha256") == _file_digest(args.walk_forward_csv)
+    )
+    assessment = assess_research_evidence(research_rows, walk_rows, manifest=manifest if artifacts_valid else None)
+    if manifest is not None and not artifacts_valid:
+        assessment["blockers"].insert(0, "Research CSV hashes do not match the provenance manifest.")
+    assessment["execution_mode"] = "alpaca-paper-only"
+    assessment["credentials_checked"] = False
+    assessment["inputs"] = {"research_csv": str(args.research_csv), "walk_forward_csv": str(args.walk_forward_csv)}
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(assessment, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print(f"Readiness: {assessment['status']}")
+    print(f"Candidate: {assessment['candidate']}")
+    print("Proven future profitability: no. Real-money trading supported: no.")
+    for blocker in assessment["blockers"]:
+        print(f"- {blocker}")
+    print(f"Wrote report to {output}")
+    return assessment
 
 
 def _risk_research(args) -> None:
@@ -1255,9 +1493,23 @@ def _status(args) -> None:
     print()
     print(f"Bot state account: {state.get('account_id', 'unknown')}")
     print(f"Submitted keys: {len(state.get('submitted_order_keys', []))}")
+    terminal = {"filled", "canceled", "expired", "rejected", "replaced"}
+    unresolved = {client_id: details for client_id, details in state.get("order_intents", {}).items()
+                  if details.get("status") not in terminal}
+    print(f"Unresolved order intents: {len(unresolved)}")
+    for client_id, details in unresolved.items():
+        print(f"  {client_id}: {details.get('status', 'unknown')}; reconcile with Alpaca before retrying")
     print(f"Reconciliation: {'ok' if reconciliation.ok else 'FAILED'}")
     for message in reconciliation.messages:
         print(f"  {message}")
+
+    activity = operator_status(args.journal_dir)
+    print(f"Operator: {activity['state']} ({activity['detail']})")
+    if "updated_at" in activity:
+        print(f"Last heartbeat: {activity['updated_at']} ({activity['age_seconds'] / 3600:.1f} hours ago)")
+    print(f"Account drawdown halt: {'LATCHED' if state.get('drawdown_halted', False) else 'not triggered'}")
+    print(f"New-buy pause: {'active' if (Path(args.journal_dir) / 'STOP_BUYS').exists() else 'off'}")
+    print(f"Full stop flag: {'active' if stop_requested(args.journal_dir) else 'off'}")
 
     if args.signals:
         print()
@@ -1295,7 +1547,7 @@ def _daily_report(args) -> None:
         f"- Cash: ${float(account.cash):,.2f}",
         f"- Buying power: ${float(account.buying_power):,.2f}",
         f"- Reconciliation: {'ok' if reconciliation.ok else 'FAILED'}",
-        f"- Protective fills synced: {synced}",
+        f"- Broker execution updates synced: {synced}",
         f"- Submitted keys: {len(state.get('submitted_order_keys', []))}",
         "",
         "## Positions",
@@ -1379,6 +1631,8 @@ def _promotion_report(args) -> None:
         f"- Recommendation: {decision['recommendation']}",
         f"- Candidate: {decision['candidate']}",
         f"- Reason: {decision['reason']}",
+        "- Scope: exploratory paper research only; this report cannot authorize real-money trading.",
+        "- Run readiness-report to check provenance and research integrity before interpreting these comparisons.",
         "",
         "## Current",
         "",
@@ -1465,7 +1719,7 @@ def _risk_promotion_decision(
     if drawdown_worsening > max_drawdown_worsening_pct:
         failures.append("drawdown worsens too much")
 
-    recommendation = "PROMOTE" if not failures else "DO NOT PROMOTE"
+    recommendation = "PAPER CANDIDATE" if not failures else "DO NOT PROMOTE"
     return {
         "recommendation": recommendation,
         "reason": "all thresholds passed" if not failures else "; ".join(failures),
@@ -1506,11 +1760,25 @@ def _promotion_decision(
     min_score_improvement: float,
     max_worst_drawdown_pct: float,
 ) -> dict[str, object]:
+    if not walk_rows:
+        raise RuntimeError("Walk-forward research CSV is empty.")
     walk_by_strategy = {row["strategy"]: row for row in walk_rows}
     current_row = _find_strategy_row(walk_by_strategy, current)
-    candidate_row = max(walk_rows, key=lambda row: (_float(row, "positive_folds"), _float(row, "avg_score")))
+    has_training_scores = bool(research_rows) and all("train_score" in row for row in research_rows)
+    selected = max(research_rows, key=lambda row: _float(row, "train_score")) if has_training_scores else None
+    candidate_row = walk_by_strategy.get(selected["strategy"]) if selected else None
+    if selected and candidate_row is None:
+        raise RuntimeError("Training-selected candidate is missing from walk-forward results.")
+    if candidate_row is None:
+        candidate_row = max(walk_rows, key=lambda row: (_float(row, "positive_folds"), _float(row, "avg_score")))
 
     failures: list[str] = []
+    if selected is None:
+        failures.append("missing training selection and holdout research evidence")
+    elif _float(selected, "test_return_pct") <= 0 or _float(selected, "test_return_pct") <= _float(selected, "benchmark_return_pct"):
+        failures.append("selected strategy lacks positive holdout benchmark edge")
+    if current_row is None:
+        failures.append("current strategy baseline is missing")
     if _float(candidate_row, "positive_folds") < min_positive_folds:
         failures.append("not enough positive walk-forward folds")
     if _float(candidate_row, "avg_edge_pct") < min_avg_edge_pct:
@@ -1522,7 +1790,7 @@ def _promotion_decision(
     if score_improvement < min_score_improvement:
         failures.append("score improvement over current strategy is too small")
 
-    recommendation = "PROMOTE" if not failures else "DO NOT PROMOTE"
+    recommendation = "PAPER CANDIDATE" if not failures else "DO NOT PROMOTE"
     reason = "all thresholds passed" if not failures else "; ".join(failures)
     return {
         "recommendation": recommendation,
@@ -1564,9 +1832,12 @@ def _promotion_row_lines(row: dict[str, str]) -> list[str]:
 
 def _float(row: dict[str, str], key: str) -> float:
     try:
-        return float(row.get(key, 0.0) or 0.0)
-    except ValueError:
-        return 0.0
+        value = float(row[key])
+        if not math.isfinite(value):
+            raise ValueError
+        return value
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Missing or invalid research metric: {key}") from exc
 
 
 def _namespace_with_output(args, output):
@@ -1744,7 +2015,7 @@ def _load_journal_fills(path: Path) -> list[Fill]:
         for row in reader:
             symbol = str(row.get("symbol", "")).upper()
             side = Side(str(row.get("side", "")).lower())
-            quantity = int(float(row.get("quantity") or 0))
+            quantity = float(row.get("quantity") or 0)
             price = float(row.get("price") or 0)
             trade_date = date.fromisoformat(str(row.get("date", "")))
             if quantity <= 0 or price <= 0:
@@ -1784,6 +2055,8 @@ def _strategy_reason_groups(rows: list[dict[str, object]]) -> list[dict[str, obj
 
 def _reason_ingredients(reason: str) -> list[str]:
     cleaned = reason.replace("submitted to Alpaca paper:", "").strip()
+    if cleaned.startswith("confirmed Alpaca execution:"):
+        return ["broker-recovered fill; original signal attribution unavailable"]
     if "synced Alpaca protective stop" in cleaned:
         return ["protective stop exit"]
     if ":" in cleaned:
@@ -1808,7 +2081,9 @@ def _strategy_trade_rows(
     benchmark_prices = benchmark_prices or {}
     lots: dict[str, list[Fill]] = {}
     rows: list[dict[str, object]] = []
-    for fill in sorted(fills, key=lambda item: item.date):
+    # Historical recovery may append sells before buys. Date-only legacy
+    # journals require buy-first ordering within a day to reconstruct FIFO.
+    for fill in sorted(fills, key=lambda item: (item.date, 0 if item.side is Side.BUY else 1)):
         if fill.side is Side.BUY:
             lots.setdefault(fill.symbol, []).append(fill)
             continue
@@ -1840,10 +2115,14 @@ def _strategy_trade_rows(
                     value=(buy.quantity - matched_quantity) * buy.price,
                     reason=buy.reason,
                 )
+        if remaining_sell > 1e-9:
+            raise RuntimeError(f"Cannot attribute {fill.symbol} sell: opening fills are missing from the journal.")
 
     for symbol, open_lots in sorted(lots.items()):
         current_price = current_prices.get(symbol)
         if current_price is None:
+            if open_lots:
+                raise RuntimeError(f"Cannot value remaining {symbol} lots: current broker position/mark is missing.")
             continue
         for buy in open_lots:
             rows.append(
@@ -2042,9 +2321,10 @@ def _print_result(config: BotConfig, result) -> None:
 
 
 def _print_live_result(result, submitted: bool) -> None:
-    print("AI Stock Trading Bot - Alpaca paper latest signal")
+    mode = "live-money" if getattr(result, "execution_mode", "alpaca-paper") == "alpaca-live" else "paper"
+    print(f"AI Stock Trading Bot - Alpaca {mode} latest signal")
     print(f"Account equity: ${result.equity:,.2f}")
-    print(f"Mode: {'submit paper orders' if submitted else 'dry run'}")
+    print(f"Mode: {'submit ' + mode + ' orders' if submitted else 'dry run'}")
     print()
 
     for decision in result.decisions:
@@ -2062,7 +2342,7 @@ def _print_live_result(result, submitted: bool) -> None:
 
     if submitted and any(decision.fill for decision in result.decisions):
         print()
-        print("Submitted fills/order requests:")
+        print("Confirmed executions:")
         for decision in result.decisions:
             if decision.fill:
                 fill = decision.fill
@@ -2072,7 +2352,7 @@ def _print_live_result(result, submitted: bool) -> None:
 def _print_research(rows, symbols: list[str]) -> None:
     print()
     print(f"Evaluated universe: {', '.join(symbols)}")
-    print("Top strategies by test score")
+    print("Strategies ranked by training score; test results are evaluation only")
     print(
         f"{'strategy':22} {'train%':>8} {'test%':>8} {'bench%':>8} {'edge%':>8} "
         f"{'dd%':>8} {'sharpe':>8} {'trades':>7} {'score':>8}"
@@ -2094,7 +2374,7 @@ def _print_research(rows, symbols: list[str]) -> None:
 
 def _print_walk_forward(rows) -> None:
     print()
-    print("Walk-forward validation")
+    print("Exploratory walk-forward results (comparing candidates reuses validation data)")
     print(
         f"{'strategy':22} {'folds':>5} {'pos':>5} {'test%':>8} {'bench%':>8} "
         f"{'edge%':>8} {'worstdd':>8} {'sharpe':>8} {'trades':>7} {'score':>8}"
@@ -2130,12 +2410,14 @@ def _print_risk_research(rows) -> None:
 
 
 def _write_research_csv(path: str, rows) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "strategy",
                 "train_return_pct",
+                "train_score",
                 "test_return_pct",
                 "benchmark_return_pct",
                 "edge_pct",
@@ -2150,6 +2432,7 @@ def _write_research_csv(path: str, rows) -> None:
                 [
                     row.spec.name,
                     f"{row.train.return_pct:.4f}",
+                    f"{row.train.score:.4f}",
                     f"{row.test.return_pct:.4f}",
                     f"{row.benchmark_return_pct:.4f}",
                     f"{row.test.return_pct - row.benchmark_return_pct:.4f}",
@@ -2163,6 +2446,7 @@ def _write_research_csv(path: str, rows) -> None:
 
 
 def _write_risk_research_csv(path: str, rows: list[dict[str, float]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -2190,6 +2474,7 @@ def _write_risk_research_csv(path: str, rows: list[dict[str, float]]) -> None:
 
 
 def _write_walk_forward_csv(path: str, rows) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -2246,6 +2531,6 @@ def _build_strategy(name: str, config: BotConfig):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(2)

@@ -586,14 +586,14 @@ class BotTests(unittest.TestCase):
         self.assertIsNone(updated.output)
         self.assertEqual(updated.journal_dir, "var")
 
-    def test_active_open_orders_filters_replacement_states(self) -> None:
+    def test_active_open_orders_retains_pending_replacements(self) -> None:
         orders = [
             SimpleNamespace(status=SimpleNamespace(value="new")),
             SimpleNamespace(status=SimpleNamespace(value="pending_replace")),
             SimpleNamespace(status=SimpleNamespace(value="canceled")),
         ]
 
-        self.assertEqual(_active_open_orders(orders), [orders[0]])
+        self.assertEqual(_active_open_orders(orders), [orders[0], orders[1]])
 
     def test_health_scorecard_detects_missing_duplicate_and_stale_stops(self) -> None:
         positions = [
@@ -788,7 +788,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(decision["recommendation"], "DO NOT PROMOTE")
         self.assertIn("average edge", decision["reason"])
 
-    def test_promotion_decision_promotes_when_thresholds_pass(self) -> None:
+    def test_promotion_decision_rejects_missing_holdout_when_fold_thresholds_pass(self) -> None:
         walk_rows = [
             {
                 "strategy": "current",
@@ -808,7 +808,8 @@ class BotTests(unittest.TestCase):
 
         decision = _promotion_decision([], walk_rows, "current", 3, 0.0, 2.0, -15.0)
 
-        self.assertEqual(decision["recommendation"], "PROMOTE")
+        self.assertEqual(decision["recommendation"], "DO NOT PROMOTE")
+        self.assertIn("missing training selection", decision["reason"])
         self.assertEqual(decision["candidate"], "candidate")
 
     def test_risk_promotion_decision_rejects_small_improvement(self) -> None:
@@ -830,7 +831,7 @@ class BotTests(unittest.TestCase):
 
         decision = _risk_promotion_decision(rows, 0.08, 0.05, 2.0, 2.0, 1.0)
 
-        self.assertEqual(decision["recommendation"], "PROMOTE")
+        self.assertEqual(decision["recommendation"], "PAPER CANDIDATE")
         self.assertEqual(decision["candidate_stop_loss_pct"], 0.10)
 
     def test_sync_alpaca_protective_fills_records_sell_once(self) -> None:
@@ -883,7 +884,9 @@ class BotTests(unittest.TestCase):
             self.assertEqual(synced, 1)
             self.assertTrue(journal.has_submitted("2026-07-09:AAPL:sell"))
             self.assertTrue(journal.has_synced_order("replacement-id"))
-            self.assertEqual(journal.expected_positions_from_fills(), {})
+            # This fixture has no opening buy: the unmatched sell must remain
+            # visible for reconciliation instead of being silently discarded.
+            self.assertEqual(journal.expected_positions_from_fills(), {"AAPL": -3})
 
     def test_sync_alpaca_protective_fills_ignores_unknown_stop(self) -> None:
         class FakeBroker:

@@ -4,6 +4,7 @@ import csv
 import math
 import random
 from collections import defaultdict
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -16,12 +17,40 @@ class MarketDataProvider(Protocol):
         """Return candles keyed by symbol, sorted by date."""
 
 
+def validate_market_data(data: dict[str, list[Candle]], symbols: list[str] | None = None) -> dict[str, list[Candle]]:
+    """Normalize and reject ambiguous or invalid bars before simulating trades."""
+    normalized: dict[str, list[Candle]] = {}
+    for key, rows in data.items():
+        symbol = key.strip().upper()
+        if not symbol or symbol in normalized:
+            raise ValueError(f"Duplicate or empty market-data symbol: {key!r}")
+        normalized[symbol] = []
+        seen: set[date] = set()
+        for candle in sorted(rows, key=lambda item: item.date):
+            if candle.symbol.strip().upper() != symbol:
+                raise ValueError(f"Candle symbol does not match market-data key {symbol}.")
+            if candle.date in seen:
+                raise ValueError(f"Duplicate candle for {symbol} on {candle.date}.")
+            seen.add(candle.date)
+            prices = (candle.open, candle.high, candle.low, candle.close)
+            if any(not math.isfinite(price) or price <= 0 for price in prices):
+                raise ValueError(f"Invalid price for {symbol} on {candle.date}.")
+            if not candle.low <= min(candle.open, candle.close) <= max(candle.open, candle.close) <= candle.high:
+                raise ValueError(f"Invalid OHLC range for {symbol} on {candle.date}.")
+            if not math.isfinite(candle.volume) or candle.volume < 0 or int(candle.volume) != candle.volume:
+                raise ValueError(f"Invalid volume for {symbol} on {candle.date}.")
+            normalized[symbol].append(replace(candle, symbol=symbol))
+    if symbols is not None:
+        missing = [symbol.upper() for symbol in symbols if not normalized.get(symbol.upper())]
+        if missing:
+            raise ValueError(f"No market data for requested symbols: {', '.join(missing)}")
+        normalized = {symbol.upper(): normalized[symbol.upper()] for symbol in symbols}
+    return normalized
+
+
 class StaticMarketDataProvider:
     def __init__(self, data: dict[str, list[Candle]]) -> None:
-        self.data = {
-            symbol.upper(): sorted(rows, key=lambda candle: candle.date)
-            for symbol, rows in data.items()
-        }
+        self.data = validate_market_data(data)
 
     def load(self, symbols: list[str]) -> dict[str, list[Candle]]:
         return {
@@ -61,7 +90,7 @@ class CsvMarketDataProvider:
                     )
                 )
 
-        return {symbol: sorted(rows, key=lambda candle: candle.date) for symbol, rows in candles.items()}
+        return validate_market_data(dict(candles), symbols)
 
 
 class DemoMarketDataProvider:
@@ -70,13 +99,13 @@ class DemoMarketDataProvider:
         self.seed = seed
 
     def load(self, symbols: list[str]) -> dict[str, list[Candle]]:
-        random.seed(self.seed)
+        rng = random.Random(self.seed)
         today = date.today()
         start = today - timedelta(days=self.days)
         data: dict[str, list[Candle]] = {}
 
         for offset, symbol in enumerate(symbols):
-            base = 80 + offset * 35 + random.random() * 20
+            base = 80 + offset * 35 + rng.random() * 20
             drift = 0.0008 + offset * 0.0002
             rows: list[Candle] = []
 
@@ -86,12 +115,12 @@ class DemoMarketDataProvider:
                     continue
 
                 seasonal = math.sin(index / 12) * 0.012
-                noise = random.gauss(0, 0.015)
+                noise = rng.gauss(0, 0.015)
                 close = max(1.0, base * (1 + drift + seasonal + noise))
                 open_price = base
-                high = max(open_price, close) * (1 + random.random() * 0.01)
-                low = min(open_price, close) * (1 - random.random() * 0.01)
-                volume = int(1_000_000 + random.random() * 2_000_000)
+                high = max(open_price, close) * (1 + rng.random() * 0.01)
+                low = min(open_price, close) * (1 - rng.random() * 0.01)
+                volume = int(1_000_000 + rng.random() * 2_000_000)
 
                 rows.append(
                     Candle(

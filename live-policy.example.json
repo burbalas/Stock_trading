@@ -1,0 +1,10 @@
+{
+  "account_id": "REPLACE_WITH_YOUR_LIVE_ACCOUNT_UUID",
+  "enabled": false,
+  "capital_limit_eur": 2500,
+  "max_total_loss_eur": 250,
+  "max_daily_loss_eur": 50,
+  "max_order_eur": 250,
+  "entry_limit_bps": 5,
+  "feed": "iex"
+}

@@ -1,8 +1,20 @@
 # AI Stock Trading Bot
 
-A usable first version of a paper-trading stock bot. It is intentionally safe by default: no live orders, no API keys required, and all trades go through an in-memory paper broker.
+A stock-strategy research tool and automated Alpaca paper-trading operator, with a separate disabled-by-default live pilot. Local simulations require no credentials; connected paper trading requires paper credentials and `--submit`. Paper commands reject real-money endpoints. The live pilot requires separate credentials, a pinned account and explicit budget configuration; it has not been exercised with real money.
 
-This is not financial advice. Treat it as a development scaffold and simulator until you have added real broker/data integrations, tested thoroughly, and understand the risks.
+**October 22:** the [corrected profitability evidence review](PROFITABILITY_EVIDENCE_REVIEW_2026-10-22.md) found USD losses at both intended sizes in the fixed 27-session diagnostic. The prepared €2,500 live ceiling stays disabled. See [live pilot preparation](LIVE_PILOT_GUIDE.md) and the [engineering review](REVIEW_2026-10-22.md). Earlier [small-capital results](SMALL_CAPITAL_REVIEW.md) used adjusted-price approximations and do not validate literal whole-share execution.
+
+For prospective profitability tracking, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\Update-ProfitabilityEvidence.ps1` weekly from this folder. It uses read-only market-data requests, freezes the existing strategy at the two intended sizes and preserves prior results. The separate prospective replay begins October 23; it does not place orders or certify real broker execution. Add `-StatusOnly` for a local-only check.
+
+**Open the app:** double-click **Stock Trading (Paper)** on the desktop or [Open-StockTrading.cmd](Open-StockTrading.cmd). The [app guide](APP_GUIDE.md) explains its background operation, start/stop controls, logs, reports and optional sign-in resume. The [October 21 review](REVIEW_2026-10-21.md) records the first verified candidate paper entries and remaining real-money work.
+
+The [September 22 readiness review](LIVE_READINESS.md) is retained as historical context; use the October 21 review for current operation.
+
+**No strategy in this repository has established future profitability.** The saved research CSVs are exploratory results, and the latest v6 candidate underperformed its benchmark. The advisor is a deterministic heuristic, not a trained predictive AI model. See [the audit and remaining limitations](AUDIT.md) and [the current setup and operating guide](OPERATING_GUIDE.md).
+
+The [2026-09-15 profitability review](PROFITABILITY_REVIEW.md) compares seven fixed candidates on archived, adjusted historical data. Slower relative strength improved on the current operator and survived higher costs, but did not beat the initially capital-matched passive benchmarks in the final period. It is the next candidate for forward paper evaluation; submitting profiles remain unchanged.
+
+For normal paper operation use the desktop shortcut. The alternative [Start-PaperCandidate.ps1](Start-PaperCandidate.ps1) launcher is described in the [operating guide](OPERATING_GUIDE.md#advanced-a-candidate-session-from-a-terminal). It previews by default; `-Submit` runs the frozen candidate until market close using Alpaca paper funds.
 
 ## What it does
 
@@ -25,6 +37,18 @@ This is not financial advice. Treat it as a development scaffold and simulator u
 - Supports Alpaca historical stock data and paper order submission.
 
 ## Quick Start
+
+On Windows, create a local environment and install dependencies first (`tzdata` is required for exchange timezones):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+python -m unittest discover -s tests
+python -m trading_bot.cli readiness-report
+```
+
+If PowerShell blocks activation, use `.\.venv\Scripts\python.exe` in place of `python` in the commands below.
 
 ```powershell
 python -m trading_bot.cli demo
@@ -102,7 +126,9 @@ You can start the session before the market opens and let it wait until the open
 python -m trading_bot.cli alpaca-session --symbols-file universe_popular.txt --profile paper-operator --submit --risk-interval-minutes 5 --signal-interval-minutes 390 --until-close --wait-for-open
 ```
 
-`alpaca-session` checks stop loss, trailing stop, account drawdown, reconciliation, and position highs on the risk interval. Strategy signals use completed daily bars, so one signal pass per market session is normally enough; the five-minute risk loop continues to use current broker prices. When submitting, it also creates or raises broker-side protective stops every 15 minutes by default. Transient API failures are retried five times before the session exits.
+`alpaca-session` checks stop loss, trailing stop, account drawdown, reconciliation, and position highs on the risk interval. Strategy signals use completed daily bars, so one signal pass per market session is normally enough; the five-minute risk loop continues to use current broker prices. When submitting, it also creates or raises broker-side protective stops every 15 minutes by default. Transient API failures are retried five times before the session exits. `--until-close --wait-for-open` waits for the first open and then stops at that session's close. Use `--continuous` to wait through nights, weekends, and exchange holidays and resume each session.
+
+Runtime controls: `var/heartbeat.json` records operator status; create `var/STOP_BUYS` to pause entries while retaining exits, or `var/STOP` to stop the session. One submitting process can use a journal directory at a time. Use one canonical journal per paper account.
 
 Record experimental Strategy V2 signals beside the sell-only operator without giving the shadow strategy order authority:
 
@@ -237,7 +263,7 @@ Retest only named finalists without rerunning the full grid:
 python -m trading_bot.cli research --data alpaca --symbols-file universe_popular.txt --expanded --strategy-filter relative-strength-189-100-b60,ensemble-20-50-c65 --walk-forward
 ```
 
-Backtests use warm-up history without trading it, execute strategy orders at the next session open, model fixed/trailing stops from daily opens and lows, and liquidate all positions when the account drawdown circuit breaker triggers.
+Backtests use warm-up history without trading it, execute strategy orders at the next session open, and model fixed/trailing stops from daily opens and lows. A drawdown detected at the close queues liquidation for the next available open. Market gaps can exceed the configured drawdown threshold. Research selection uses training scores; chronological test results remain evaluation data. CSV exports now include a manifest describing source data, parameters, limitations, and output hashes.
 
 Compare stop-loss and trailing-stop settings while keeping the entry strategy fixed:
 
@@ -257,7 +283,7 @@ Decide whether research evidence is strong enough to change the live strategy:
 python -m trading_bot.cli promotion-report --research-csv research_expanded.csv --walk-forward-csv research_expanded_walkforward.csv
 ```
 
-The promotion report rejects strategy changes unless the candidate passes walk-forward thresholds for positive folds, benchmark edge, drawdown, and score improvement over the current strategy.
+The promotion report screens exploratory paper candidates using training selection, positive test-period benchmark edge, walk-forward thresholds, drawdown, and score improvement. It does not authorize real-money deployment. `readiness-report` checks matching research provenance and performance, and cannot label synthetic or legacy unverified results as proof of profitability.
 
 Expected CSV columns:
 
@@ -315,4 +341,4 @@ Keep credentials out of source control. If a key is pasted into a chat, commit, 
 - Keep new strategies signal-only. They should return `Signal`, never submit orders.
 - Keep order sizing, cash management, position limits, stop losses, and Alpaca submission in `portfolio.py`, `risk.py`, `live.py`, and broker adapters.
 
-Keep live trading behind an explicit config flag and start with tiny paper tests. Real brokerage APIs can fail, reject, delay, partially fill, or execute at unexpected prices.
+The supplied broker adapter only supports Alpaca paper trading. Order acknowledgments are not fills: journals track confirmed cumulative executions, including partial fills, and reconcile them after restart. Whole-share long positions are supported for automated order planning; fractional or short holdings require resolution before trading resumes.

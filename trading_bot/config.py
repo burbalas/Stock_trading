@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -27,8 +28,29 @@ class BotConfig:
     buy_cooldown_days: int = 3
 
     def validate(self) -> None:
-        if not self.symbols:
+        if not isinstance(self.symbols, list) or not self.symbols:
             raise ValueError("At least one symbol is required.")
+        if any(not isinstance(symbol, str) or not symbol.strip() or symbol != symbol.strip() for symbol in self.symbols):
+            raise ValueError("symbols must contain nonempty ticker strings without surrounding whitespace.")
+        if len({symbol.upper() for symbol in self.symbols}) != len(self.symbols):
+            raise ValueError("symbols must be unique (case insensitive).")
+        for name in (
+            "starting_cash", "max_position_pct", "max_order_pct", "min_trade_value",
+            "target_cash_pct", "stop_loss_pct", "trailing_stop_pct", "slippage_bps",
+            "commission_per_trade", "max_drawdown_stop_pct", "min_confidence",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+                raise ValueError(f"{name} must be a finite number.")
+        for name in ("max_open_positions", "max_daily_orders", "short_window", "long_window", "buy_cooldown_days"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer.")
+        for name in ("allow_short_selling", "allow_new_buys", "allow_position_adds"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean.")
+        if self.allow_short_selling:
+            raise ValueError("Short selling is not supported by this long-only bot.")
         if self.starting_cash <= 0:
             raise ValueError("starting_cash must be positive.")
         if not 0 < self.max_position_pct <= 1:
@@ -47,8 +69,8 @@ class BotConfig:
             raise ValueError("stop_loss_pct must be between 0 and 1.")
         if not 0 < self.trailing_stop_pct < 1:
             raise ValueError("trailing_stop_pct must be between 0 and 1.")
-        if self.slippage_bps < 0:
-            raise ValueError("slippage_bps cannot be negative.")
+        if not 0 <= self.slippage_bps < 10_000:
+            raise ValueError("slippage_bps must be between 0 (inclusive) and 10000 (exclusive).")
         if self.commission_per_trade < 0:
             raise ValueError("commission_per_trade cannot be negative.")
         if not 0 < self.max_drawdown_stop_pct < 1:
